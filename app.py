@@ -6,233 +6,275 @@ import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-import pennylane as qml
-import shap
 
-# ============================================================
-# 1. PAGE CONFIGURATION
-# ============================================================
+try:
+    import pennylane as qml
+except Exception:
+    qml = None
+
+try:
+    import shap
+except Exception:
+    shap = None
+
+
+# --------------------------------------------------
+# PAGE CONFIGURATION
+# --------------------------------------------------
 st.set_page_config(
-    page_title="Hybrid Quantum Churn AI",
-    page_icon="⚛️",
+    page_title="Hybrid Churn Prediction",
+    page_icon="📡",
     layout="wide"
 )
 
+st.title("📡 Hybrid Quantum–Classical Customer Churn Prediction")
+st.caption(
+    "Telecom customer churn prediction with explainable AI"
+)
+
+
+# --------------------------------------------------
+# FIND SAVED MODEL FILES
+# Supports both possible artifact folder names.
+# Also searches inside subfolders.
+# --------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-ARTIFACT_DIR = "churn_model_artifacts"
 
-st.markdown("""
-<style>
-.main-title {
-    font-size: 2.2rem;
-    font-weight: 750;
-}
-.subtitle {
-    color: #8b95a5;
-    font-size: 1rem;
-}
-</style>
-""", unsafe_allow_html=True)
+ARTIFACT_DIRS = [
+    BASE_DIR / "churn_model_artifacts",
+    BASE_DIR / "model_artifacts",
+]
 
-# ============================================================
-# 2. LOAD SAVED MODELS AND CONFIGURATION
-# ============================================================
+
+def find_artifact(filename):
+    for folder in ARTIFACT_DIRS:
+        if folder.exists():
+            candidate = folder / filename
+            if candidate.is_file():
+                return candidate
+
+            matches = list(folder.rglob(filename))
+            if matches:
+                return matches[0]
+
+    # Final fallback: search the project directory.
+    matches = [
+        p for p in BASE_DIR.rglob(filename)
+        if ".git" not in p.parts
+    ]
+    if matches:
+        return matches[0]
+
+    raise FileNotFoundError(
+        f"Cannot find {filename}. "
+        "Check that it is uploaded to your GitHub repository."
+    )
+
+
+# --------------------------------------------------
+# LOAD SAVED ARTIFACTS
+# --------------------------------------------------
 @st.cache_resource
 def load_artifacts():
-    model = joblib.load(ARTIFACTS / "classical_baseline.joblib")
-    scaler = joblib.load(ARTIFACTS / "quantum_feature_scaler.joblib")
+    model_path = find_artifact("classical_baseline.joblib")
+    scaler_path = find_artifact("quantum_feature_scaler.joblib")
+    weights_path = find_artifact("quantum_weights.npy")
 
-    with open(ARTIFACTS / "feature_names.json", encoding="utf-8") as f:
-        feature_names = json.load(f)
+    model = joblib.load(model_path)
+    scaler = joblib.load(scaler_path)
+    weights = np.load(weights_path)
 
-    with open(ARTIFACTS / "quantum_config.json", encoding="utf-8") as f:
-        config = json.load(f)
+    try:
+        feature_path = find_artifact("feature_names.json")
+        with open(feature_path, "r", encoding="utf-8") as file:
+            features = json.load(file)
+    except FileNotFoundError:
+        features = [
+            "tenure",
+            "InternetService_Fiber optic",
+            "PaymentMethod_Electronic check",
+            "Contract_Two year",
+        ]
 
-    with open(ARTIFACTS / "evaluation_results.json", encoding="utf-8") as f:
-        evaluation = json.load(f)
+    if isinstance(features, dict):
+        features = features.get("feature_names", list(features.keys()))
 
-    weights = np.load(ARTIFACTS / "quantum_weights.npy")
+    try:
+        config_path = find_artifact("quantum_config.json")
+        with open(config_path, "r", encoding="utf-8") as file:
+            config = json.load(file)
+    except FileNotFoundError:
+        config = {"n_qubits": 4}
 
-    return model, scaler, feature_names, config, evaluation, weights
+    return model, scaler, weights, features, config
 
 
 try:
-    model, scaler, feature_names, config, evaluation, weights = load_artifacts()
-except Exception as exc:
-    st.error(f"Could not load saved model files: {exc}")
-    st.info("Check that all model artifacts are inside the model_artifacts folder.")
+    classical_model, scaler, quantum_weights, feature_names, config = (
+        load_artifacts()
+    )
+    st.success("Saved model files loaded successfully.")
+except Exception as error:
+    st.error(f"Could not load saved model files: {error}")
+    st.info(
+        "Check that classical_baseline.joblib, "
+        "quantum_feature_scaler.joblib, quantum_weights.npy, "
+        "and the JSON files are uploaded to your GitHub repository."
+    )
     st.stop()
 
-n_qubits = int(config["n_qubits"])
-threshold = float(config.get("probability_threshold", 0.5))
 
-if len(weights) != n_qubits or len(feature_names) != n_qubits:
-    st.error("The saved feature count, qubit count, and weights do not match.")
-    st.stop()
+# --------------------------------------------------
+# QUANTUM CIRCUIT
+# This follows the saved 4-qubit circuit configuration.
+# --------------------------------------------------
+def quantum_score(scaled_features):
+    if qml is None:
+        raise RuntimeError(
+            "PennyLane is unavailable. Check requirements.txt "
+            "and the Streamlit deployment logs."
+        )
 
-# ============================================================
-# 3. QUANTUM CIRCUIT
-# ============================================================
-device = qml.device("default.qubit", wires=n_qubits)
+    n_qubits = int(config.get("n_qubits", 4))
 
+    if n_qubits != 4 or len(scaled_features) != 4:
+        raise ValueError(
+            "This app expects the trained four-feature, four-qubit model."
+        )
 
-@qml.qnode(device, interface="numpy", diff_method=None)
-def quantum_circuit(inputs, trainable_weights):
-    # RY feature encoding
-    for i in range(n_qubits):
-        qml.RY(inputs[i], wires=i)
+    device = qml.device("default.qubit", wires=n_qubits)
 
-    # Trainable RY and RZ rotations
-    for i in range(n_qubits):
-        qml.RY(trainable_weights[i], wires=i)
-        qml.RZ(trainable_weights[i], wires=i)
+    @qml.qnode(device)
+    def circuit(inputs, weights):
+        for i in range(n_qubits):
+            qml.RY(inputs[i], wires=i)
 
-    # Nearest-neighbour CNOT entanglement
-    for i in range(n_qubits - 1):
-        qml.CNOT(wires=[i, i + 1])
+        for i in range(n_qubits):
+            qml.RY(weights[i], wires=i)
+            qml.RZ(weights[i], wires=i)
 
-    # Pauli-Z measurement
-    return qml.expval(qml.PauliZ(0))
+        for i in range(n_qubits - 1):
+            qml.CNOT(wires=[i, i + 1])
 
+        return qml.expval(qml.PauliZ(0))
 
-def quantum_probability(scaled_features):
     expectation = float(
-        quantum_circuit(
+        circuit(
             np.asarray(scaled_features, dtype=float),
-            np.asarray(weights, dtype=float)
+            np.asarray(quantum_weights, dtype=float),
         )
     )
 
-    # Assumes the original notebook used this probability mapping.
-    probability = (expectation + 1.0) / 2.0
-
-    return float(np.clip(probability, 0.0, 1.0)), expectation
-
-
-def classical_probability(scaled_features):
-    return float(
-        model.predict_proba(
-            np.asarray(scaled_features).reshape(1, -1)
-        )[0, 1]
-    )
+    # Converts the Pauli-Z expectation into a 0-to-1 score.
+    # This score is not guaranteed to be a calibrated probability.
+    return float(np.clip((expectation + 1.0) / 2.0, 0.0, 1.0))
 
 
-# ============================================================
-# 4. REFERENCE TEST METRICS
-# ============================================================
-metrics = {
-    "Quantum": {
-        "Accuracy": 0.6544,
-        "Precision": 0.4158,
-        "Recall": 0.7460,
-        "F1-score": 0.5340,
-        "ROC-AUC": 0.7509
-    },
-    "Classical": {
-        "Accuracy": 0.7445,
-        "Precision": 0.5127,
-        "Recall": 0.7567,
-        "F1-score": 0.6112,
-        "ROC-AUC": 0.8243
-    }
-}
-
-# ============================================================
-# 5. HEADER AND NAVIGATION
-# ============================================================
-st.markdown(
-    '<div class="main-title">⚛️ Hybrid Quantum–Classical Churn AI</div>',
-    unsafe_allow_html=True
-)
-st.markdown(
-    '<div class="subtitle">Telecom Customer Churn Prediction | '
-    'Quantum ML | Explainable AI</div>',
-    unsafe_allow_html=True
-)
-
-st.sidebar.title("Navigation")
-
+# --------------------------------------------------
+# SIDEBAR NAVIGATION
+# --------------------------------------------------
 page = st.sidebar.radio(
-    "Choose a section",
+    "Navigation",
     [
         "Dashboard",
         "Customer Prediction",
         "Model Comparison",
         "Explainable AI",
-        "Project Details"
-    ]
+        "Project Details",
+    ],
 )
 
 st.sidebar.divider()
-st.sidebar.caption(f"Quantum circuit: {n_qubits} qubits")
-st.sidebar.caption(f"Training epochs: {config.get('epochs', 5)}")
-st.sidebar.caption(
-    f"Training sample: {config.get('training_sample_size', 'N/A')}"
-)
+st.sidebar.caption("Hybrid Quantum–Classical ML")
+st.sidebar.caption("PennyLane simulator + classical ML + SHAP")
 
-# ============================================================
-# 6. DASHBOARD
-# ============================================================
+
+# --------------------------------------------------
+# PRELIMINARY NOTEBOOK EVALUATION RESULTS
+# These are the previously recorded results.
+# They are not recalculated by this website.
+# --------------------------------------------------
+quantum_metrics = {
+    "Accuracy": 0.6544,
+    "Precision": 0.4158,
+    "Recall": 0.7460,
+    "F1-score": 0.5340,
+    "ROC-AUC": 0.7509,
+}
+
+classical_metrics = {
+    "Accuracy": 0.7445,
+    "Precision": 0.5127,
+    "Recall": 0.7567,
+    "F1-score": 0.6112,
+    "ROC-AUC": 0.8243,
+}
+
+
+# --------------------------------------------------
+# DASHBOARD
+# --------------------------------------------------
 if page == "Dashboard":
-    st.subheader("Model Performance Dashboard")
+    st.header("Project Dashboard")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Quantum Qubits", n_qubits)
-    c2.metric("Training Epochs", config.get("epochs", 5))
-    c3.metric("Quantum ROC-AUC", f"{metrics['Quantum']['ROC-AUC']:.2%}")
-    c4.metric("Classical ROC-AUC", f"{metrics['Classical']['ROC-AUC']:.2%}")
+    st.write(
+        "This project compares a four-qubit quantum circuit "
+        "with a classical Logistic Regression baseline for "
+        "telecom customer churn prediction."
+    )
 
-    st.divider()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Dataset records", "7,043")
+    col2.metric("Selected features", "4")
+    col3.metric("Quantum circuit", "4 qubits")
 
-    left, right = st.columns(2)
+    st.subheader("Previously recorded evaluation results")
 
-    with left:
-        st.markdown("#### Accuracy comparison")
-        df = pd.DataFrame({
-            "Model": ["Quantum", "Classical"],
-            "Accuracy": [
-                metrics["Quantum"]["Accuracy"],
-                metrics["Classical"]["Accuracy"]
-            ]
-        }).set_index("Model")
-        st.bar_chart(df)
+    comparison = pd.DataFrame(
+        {
+            "Metric": list(quantum_metrics.keys()),
+            "Quantum model": list(quantum_metrics.values()),
+            "Classical baseline": list(classical_metrics.values()),
+        }
+    ).set_index("Metric")
 
-    with right:
-        st.markdown("#### ROC-AUC comparison")
-        df = pd.DataFrame({
-            "Model": ["Quantum", "Classical"],
-            "ROC-AUC": [
-                metrics["Quantum"]["ROC-AUC"],
-                metrics["Classical"]["ROC-AUC"]
-            ]
-        }).set_index("Model")
-        st.bar_chart(df)
-
-    st.markdown("#### Evaluation metrics")
     st.dataframe(
-        pd.DataFrame(metrics).T.style.format("{:.2%}"),
-        use_container_width=True
+        comparison.style.format("{:.2%}"),
+        use_container_width=True,
     )
 
-    st.info(
-        "These are recorded test-set results from the notebook, not newly "
-        "calculated metrics. The quantum model is a preliminary prototype."
+    st.bar_chart(comparison)
+
+    st.warning(
+        "These are the preliminary results recorded from the notebook. "
+        "The classical baseline performed better on accuracy, F1-score, "
+        "and ROC-AUC. Do not interpret this as demonstrated quantum "
+        "advantage."
     )
 
-# ============================================================
-# 7. CUSTOMER PREDICTION
-# ============================================================
+
+# --------------------------------------------------
+# CUSTOMER PREDICTION
+# --------------------------------------------------
 elif page == "Customer Prediction":
-    st.subheader("Predict Customer Churn")
+    st.header("Predict Customer Churn")
+
+    st.write(
+        "Enter a customer's details to compare the saved classical model "
+        "with the quantum circuit simulator."
+    )
 
     with st.form("customer_form"):
         tenure = st.slider(
-            "Customer tenure (months)", 0, 72, 24
+            "Customer tenure (months)",
+            min_value=0,
+            max_value=72,
+            value=12,
         )
 
-        internet = st.selectbox(
+        fiber = st.selectbox(
             "Internet service",
-            ["DSL", "Fiber optic", "No"]
+            ["DSL", "Fiber optic", "No internet service"],
         )
 
         payment = st.selectbox(
@@ -240,385 +282,350 @@ elif page == "Customer Prediction":
             [
                 "Electronic check",
                 "Mailed check",
-                "Bank transfer",
-                "Credit card"
-            ]
+                "Bank transfer (automatic)",
+                "Credit card (automatic)",
+            ],
         )
 
         contract = st.selectbox(
             "Contract type",
-            ["Month-to-month", "One year", "Two year"]
+            ["Month-to-month", "One year", "Two year"],
         )
 
         submitted = st.form_submit_button(
-            "Run Hybrid Prediction",
-            use_container_width=True
+            "Predict Churn",
+            use_container_width=True,
         )
 
     if submitted:
-        feature_values = {
-            "tenure": float(tenure),
-            "InternetService_Fiber optic": float(internet == "Fiber optic"),
-            "PaymentMethod_Electronic check": float(
-                payment == "Electronic check"
-            ),
-            "Contract_Two year": float(contract == "Two year")
-        }
-
-        row = np.array(
-            [[feature_values[name] for name in feature_names]],
-            dtype=float
+        # Match the exact saved feature order.
+        raw = np.array(
+            [[
+                tenure,
+                int(fiber == "Fiber optic"),
+                int(payment == "Electronic check"),
+                int(contract == "Two year"),
+            ]],
+            dtype=float,
         )
+
+        if len(feature_names) != raw.shape[1]:
+            st.error(
+                "The saved feature_names.json does not contain "
+                "the expected four features."
+            )
+            st.stop()
 
         try:
-            scaled = scaler.transform(row)[0]
-            q_prob, q_expectation = quantum_probability(scaled)
-            c_prob = classical_probability(scaled)
+            scaled = scaler.transform(raw)
 
-            result = {
-                "features": feature_values,
-                "scaled": scaled,
-                "quantum_probability": q_prob,
-                "quantum_expectation": q_expectation,
-                "quantum_class": int(q_prob >= threshold),
-                "classical_probability": c_prob,
-                "classical_class": int(c_prob >= threshold)
-            }
+            # Classical prediction from the saved model.
+            classical_probability = float(
+                classical_model.predict_proba(scaled)[0][1]
+            )
 
-            st.session_state["last_prediction"] = result
+            # Quantum score from the saved weights.
+            q_score = quantum_score(scaled[0])
 
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Classical model")
+                st.metric(
+                    "Estimated churn probability",
+                    f"{classical_probability:.1%}",
+                )
+                if classical_probability >= 0.5:
+                    st.error("Model prediction: Higher churn risk")
+                else:
+                    st.success("Model prediction: Lower churn risk")
+
+            with col2:
+                st.subheader("Quantum circuit")
+                st.metric("Quantum churn score", f"{q_score:.1%}")
+                st.caption(
+                    "Circuit-derived score; not a calibrated probability."
+                )
+                if q_score >= 0.5:
+                    st.warning("Score is on the higher side")
+                else:
+                    st.info("Score is on the lower side")
+
+            st.subheader("Customer features used")
+            input_table = pd.DataFrame(raw, columns=feature_names)
+            st.dataframe(input_table, use_container_width=True)
+
+            # Store session-only history.
             if "prediction_history" not in st.session_state:
-                st.session_state["prediction_history"] = []
+                st.session_state.prediction_history = []
 
-            st.session_state["prediction_history"].append({
-                "Tenure": tenure,
-                "Internet": internet,
-                "Payment": payment,
-                "Contract": contract,
-                "Quantum score": q_prob,
-                "Classical score": c_prob
-            })
-
-        except Exception as exc:
-            st.error(f"Prediction failed: {exc}")
-
-    result = st.session_state.get("last_prediction")
-
-    if result:
-        st.divider()
-        left, right = st.columns(2)
-
-        with left:
-            st.markdown("### ⚛️ Quantum prediction")
-            st.metric("Quantum score", f"{result['quantum_probability']:.1%}")
-            st.progress(result["quantum_probability"])
-            st.write(
-                "Likely to churn"
-                if result["quantum_class"]
-                else "Unlikely to churn"
-            )
-            st.caption(
-                f"Pauli-Z expectation: {result['quantum_expectation']:.4f}"
+            st.session_state.prediction_history.append(
+                {
+                    "Tenure": tenure,
+                    "Internet service": fiber,
+                    "Payment method": payment,
+                    "Contract": contract,
+                    "Classical churn probability": classical_probability,
+                    "Quantum churn score": q_score,
+                }
             )
 
-        with right:
-            st.markdown("### Classical prediction")
-            st.metric(
-                "Churn probability",
-                f"{result['classical_probability']:.1%}"
-            )
-            st.progress(result["classical_probability"])
-            st.write(
-                "Likely to churn"
-                if result["classical_class"]
-                else "Unlikely to churn"
-            )
-
-        st.markdown("#### Customer risk guidance")
-        highest_score = max(
-            result["quantum_probability"],
-            result["classical_probability"]
-        )
-
-        if highest_score >= 0.70:
-            st.warning(
-                "At least one model indicates elevated risk. Review customer "
-                "feedback and service concerns before deciding on retention action."
-            )
-        elif highest_score >= 0.40:
-            st.info(
-                "The scores suggest possible risk. Monitor the customer and "
-                "investigate any service concerns."
-            )
-        else:
-            st.success(
-                "Both scores are below the illustrative elevated-risk range."
-            )
-
-        st.caption(
-            "These are model scores, not guarantees. Risk bands are illustrative."
-        )
-
-        st.markdown("#### Model score comparison")
-        comparison = pd.DataFrame({
-            "Model": ["Quantum", "Classical"],
-            "Churn score": [
-                result["quantum_probability"],
-                result["classical_probability"]
-            ]
-        }).set_index("Model")
-        st.bar_chart(comparison)
+        except Exception as error:
+            st.error(f"Prediction failed: {error}")
 
     if st.session_state.get("prediction_history"):
-        st.markdown("#### Prediction history")
-        history = pd.DataFrame(st.session_state["prediction_history"])
-        st.dataframe(history, use_container_width=True, hide_index=True)
+        st.subheader("Current session prediction history")
+        history = pd.DataFrame(st.session_state.prediction_history)
+        st.dataframe(history, use_container_width=True)
 
+        csv_data = history.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download prediction history CSV",
-            data=history.to_csv(index=False).encode("utf-8"),
+            "Download prediction history (CSV)",
+            data=csv_data,
             file_name="churn_prediction_history.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
-# ============================================================
-# 8. MODEL COMPARISON
-# ============================================================
+
+# --------------------------------------------------
+# MODEL COMPARISON
+# --------------------------------------------------
 elif page == "Model Comparison":
-    st.subheader("Quantum vs Classical Model Evaluation")
+    st.header("Quantum vs Classical Model")
 
-    selected_metric = st.selectbox(
-        "Choose evaluation metric",
-        ["Accuracy", "Precision", "Recall", "F1-score", "ROC-AUC"]
-    )
-
-    comparison_df = pd.DataFrame({
-        "Model": ["Quantum", "Classical"],
-        selected_metric: [
-            metrics["Quantum"][selected_metric],
-            metrics["Classical"][selected_metric]
-        ]
-    }).set_index("Model")
-
-    st.bar_chart(comparison_df)
+    comparison = pd.DataFrame(
+        {
+            "Metric": list(quantum_metrics.keys()),
+            "Quantum model": list(quantum_metrics.values()),
+            "Classical baseline": list(classical_metrics.values()),
+        }
+    ).set_index("Metric")
 
     st.dataframe(
-        pd.DataFrame(metrics).T.style.format("{:.2%}"),
-        use_container_width=True
+        comparison.style.format("{:.2%}"),
+        use_container_width=True,
     )
 
-    st.warning(
-        "The recorded classical model performs better on all five listed "
-        "metrics. These results do not establish quantum advantage."
+    st.subheader("Metric comparison")
+    st.bar_chart(comparison)
+
+    st.markdown(
+        """
+        **Interpretation**
+
+        - Accuracy measures the fraction of correct predictions.
+        - Precision measures how many predicted churners actually churned.
+        - Recall measures how many actual churners were detected.
+        - F1-score balances precision and recall.
+        - ROC-AUC measures ranking ability across thresholds.
+
+        The previously recorded classical baseline outperformed the
+        quantum model on accuracy, F1-score, and ROC-AUC. The quantum
+        model's training used a small subset of the dataset, so these
+        results are preliminary.
+        """
     )
 
-# ============================================================
-# 9. EXPLAINABLE AI WITH SHAP
-# ============================================================
+
+# --------------------------------------------------
+# EXPLAINABLE AI
+# --------------------------------------------------
 elif page == "Explainable AI":
-    st.subheader("Explainable AI — SHAP Analysis")
+    st.header("Explainable AI")
 
     st.write(
-        "SHAP explains how input features influence the classical "
-        "Logistic Regression model's output."
+        "SHAP explains the saved classical model. The quantum section "
+        "shows a simple sensitivity analysis and is not a SHAP explanation."
     )
 
-    result = st.session_state.get("last_prediction")
+    tenure = st.slider(
+        "Tenure for explanation (months)",
+        0, 72, 12,
+        key="shap_tenure",
+    )
+    fiber = st.selectbox(
+        "Internet service",
+        ["DSL", "Fiber optic", "No internet service"],
+        key="shap_fiber",
+    )
+    payment = st.selectbox(
+        "Payment method",
+        [
+            "Electronic check",
+            "Mailed check",
+            "Bank transfer (automatic)",
+            "Credit card (automatic)",
+        ],
+        key="shap_payment",
+    )
+    contract = st.selectbox(
+        "Contract type",
+        ["Month-to-month", "One year", "Two year"],
+        key="shap_contract",
+    )
 
-    if result is None:
-        st.info(
-            "Go to Customer Prediction, run a prediction, and return here "
-            "to view its SHAP explanation."
+    raw = np.array(
+        [[
+            tenure,
+            int(fiber == "Fiber optic"),
+            int(payment == "Electronic check"),
+            int(contract == "Two year"),
+        ]],
+        dtype=float,
+    )
+
+    scaled = scaler.transform(raw)
+    st.subheader("Classical model explanation")
+
+    if shap is None:
+        st.warning(
+            "SHAP is not installed. Add shap to requirements.txt "
+            "and allow the app to redeploy."
         )
     else:
         try:
-            customer = np.asarray(
-                result["scaled"], dtype=float
-            ).reshape(1, -1)
-
-            # LinearExplainer explains the fitted linear model.
-            # Background is zero in scaled space, representing the training
-            # mean for a StandardScaler.
-            background = np.zeros((1, len(feature_names)))
-
-            explainer = shap.LinearExplainer(model, background)
-            explanation = explainer(customer)
+            background = np.zeros((1, scaled.shape[1]))
+            explainer = shap.LinearExplainer(
+                classical_model,
+                background,
+            )
+            explanation = explainer(scaled)
 
             values = np.asarray(explanation.values)
 
             if values.ndim == 3:
-                # Select the positive class if SHAP returns class outputs.
-                values = values[0, :, 1]
+                values = values[0, :, -1]
             elif values.ndim == 2:
                 values = values[0]
-            else:
-                values = values.reshape(-1)
 
             if len(values) != len(feature_names):
-                st.error(
-                    f"Unexpected SHAP output shape: "
-                    f"{np.asarray(explanation.values).shape}"
+                raise ValueError(
+                    "SHAP returned a shape that does not match "
+                    "the saved feature list."
                 )
-                st.stop()
 
-            shap_df = pd.DataFrame({
-                "Feature": feature_names,
-                "SHAP value": values
-            })
-            shap_df["Absolute impact"] = shap_df["SHAP value"].abs()
-            shap_df = shap_df.sort_values(
-                "Absolute impact", ascending=False
+            shap_table = pd.DataFrame(
+                {
+                    "Feature": feature_names,
+                    "SHAP value": values,
+                    "Absolute contribution": np.abs(values),
+                }
+            ).sort_values(
+                "Absolute contribution",
+                ascending=False,
             )
 
-            st.markdown("### 1. Feature contribution chart")
-            st.caption(
-                "Positive SHAP values push the model output toward churn; "
-                "negative values push it away from churn. For this linear "
-                "model, values are normally on the log-odds scale."
-            )
-
+            st.dataframe(shap_table, use_container_width=True)
             st.bar_chart(
-                shap_df.set_index("Feature")[["SHAP value"]]
-            )
-
-            st.markdown("### 2. Feature contribution table")
-            st.dataframe(
-                shap_df[["Feature", "SHAP value"]],
-                use_container_width=True,
-                hide_index=True
-            )
-
-            st.markdown("### 3. Customer prediction summary")
-
-            base_values = np.asarray(
-                explanation.base_values
-            ).reshape(-1)
-            base_value = float(base_values[0])
-
-            c1, c2 = st.columns(2)
-            c1.metric("SHAP baseline output", f"{base_value:.4f}")
-            c2.metric(
-                "Classical churn probability",
-                f"{result['classical_probability']:.1%}"
-            )
-
-            top_feature = shap_df.iloc[0]
-
-            if top_feature["SHAP value"] > 0:
-                direction = "toward a higher model output"
-            elif top_feature["SHAP value"] < 0:
-                direction = "toward a lower model output"
-            else:
-                direction = "with zero contribution"
-
-            st.markdown("### 4. Interpretation")
-            st.write(
-                f"The largest absolute SHAP contribution for this customer "
-                f"is **{top_feature['Feature']}**, pushing the model output "
-                f"{direction}."
+                shap_table.set_index("Feature")[["SHAP value"]]
             )
 
             st.caption(
-                "SHAP values and the baseline are not churn percentages. "
-                "They explain the model output and should not be added "
-                "directly to the displayed probability."
+                "SHAP values describe contributions on the model's "
+                "output scale, generally log-odds for Logistic Regression. "
+                "They are not percentage-point changes in probability."
             )
 
-        except Exception as exc:
-            st.error(f"SHAP explanation failed: {exc}")
-            st.info(
-                "Copy the complete error message and send it to me "
-                "so I can help correct it."
+        except Exception as error:
+            st.warning(
+                "SHAP could not generate the explanation for this model. "
+                f"Details: {error}"
             )
 
     st.divider()
-    st.markdown("### Quantum model sensitivity analysis")
+    st.subheader("Quantum feature sensitivity")
 
-    st.write(
-        "This separate analysis changes one scaled feature at a time from "
-        "a zero-vector reference. It is a sensitivity analysis, not SHAP."
+    st.caption(
+        "This compares the circuit score when one encoded feature is "
+        "changed. It is a sensitivity check, not SHAP."
     )
 
-    if result is not None:
-        reference = np.zeros(n_qubits, dtype=float)
-        reference_probability, _ = quantum_probability(reference)
-        scaled = np.asarray(result["scaled"], dtype=float)
-        rows = []
+    try:
+        baseline = raw[0].copy()
+        baseline_scaled = scaler.transform([baseline])[0]
+        baseline_score = quantum_score(baseline_scaled)
 
-        for i, name in enumerate(feature_names):
-            changed = reference.copy()
-            changed[i] = scaled[i]
-            changed_probability, _ = quantum_probability(changed)
+        sensitivity_rows = []
 
-            rows.append({
-                "Feature": name,
-                "Reference score": reference_probability,
-                "One-feature score": changed_probability,
-                "Score change": changed_probability - reference_probability
-            })
+        for index, name in enumerate(feature_names):
+            changed = baseline.copy()
 
-        sensitivity_df = pd.DataFrame(rows)
+            if name == "tenure":
+                changed[index] = 72 if baseline[index] < 36 else 0
+            else:
+                changed[index] = 1 - changed[index]
 
-        st.bar_chart(
-            sensitivity_df.set_index("Feature")[["Score change"]]
-        )
-        st.dataframe(
-            sensitivity_df,
-            use_container_width=True,
-            hide_index=True
-        )
+            changed_scaled = scaler.transform([changed])[0]
+            changed_score = quantum_score(changed_scaled)
 
-# ============================================================
-# 10. PROJECT DETAILS
-# ============================================================
+            sensitivity_rows.append(
+                {
+                    "Feature changed": name,
+                    "Baseline quantum score": baseline_score,
+                    "Changed quantum score": changed_score,
+                    "Score difference": changed_score - baseline_score,
+                }
+            )
+
+        sensitivity = pd.DataFrame(sensitivity_rows)
+        st.dataframe(sensitivity, use_container_width=True)
+
+    except Exception as error:
+        st.warning(f"Quantum sensitivity analysis failed: {error}")
+
+
+# --------------------------------------------------
+# PROJECT DETAILS
+# --------------------------------------------------
 elif page == "Project Details":
-    st.subheader("Project Architecture")
+    st.header("Project Details")
 
-    st.markdown("""
-    **Telecom customer input**
-
-    ↓
-
-    **Feature selection and scaling**
-
-    ↓
-
-    **Parallel model predictions**
-    - Classical Logistic Regression
-    - Four-qubit PennyLane quantum circuit
-
-    ↓
-
-    **Prediction comparison and dashboard**
-
-    ↓
-
-    **Explainable AI**
-    - SHAP for the classical model
-    - One-feature sensitivity analysis for the quantum model
-    """)
-
-    st.markdown("#### Quantum configuration")
-    st.json(config)
-
-    st.markdown("#### Saved quantum weights")
-    st.write(weights.tolist())
-
-    st.markdown("#### Research limitations")
+    st.subheader("Project title")
     st.write(
-        "- The quantum model was trained on 160 samples for five epochs."
-    )
-    st.write(
-        "- The classical baseline achieved better recorded test metrics."
-    )
-    st.write(
-        "- The quantum circuit runs on a local simulator, not physical quantum hardware."
-    )
-    st.write(
-        "- The quantum sensitivity analysis is not a validated SHAP explanation."
+        "Hybrid Quantum–Classical Machine Learning for Telecom "
+        "Customer Churn Prediction with Explainable AI"
     )
 
-st.divider()
-st.caption(
-    "Hybrid Quantum–Classical Telecom Churn Prediction | Academic Prototype"
-)
+    st.subheader("Workflow")
+    st.code(
+        "Telecom data\n"
+        "   ↓\n"
+        "Preprocessing and feature selection\n"
+        "   ↓\n"
+        "Four selected features\n"
+        "   ↓\n"
+        "Four-qubit quantum circuit\n"
+        "   ↓\n"
+        "Quantum score and classical prediction\n"
+        "   ↓\n"
+        "SHAP explanation for the classical model",
+        language="text",
+    )
+
+    st.subheader("Technology stack")
+    st.markdown(
+        """
+        - Python
+        - Streamlit
+        - Scikit-learn
+        - PennyLane quantum simulator
+        - SHAP explainability
+        - NumPy and Pandas
+        """
+    )
+
+    st.subheader("Important limitations")
+    st.markdown(
+        """
+        - The quantum circuit runs on a simulator, not physical quantum hardware.
+        - The quantum model was trained on a small subset in the preliminary experiment.
+        - The quantum score is not guaranteed to be a calibrated probability.
+        - SHAP in this app explains the classical model, not the quantum circuit.
+        - The preliminary results do not demonstrate quantum advantage.
+        """
+    )
+
+    st.info(
+        "For a final academic report, verify the prediction preprocessing "
+        "and circuit implementation against the original training notebook."
+    )
