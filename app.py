@@ -19,7 +19,7 @@ st.set_page_config(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-ARTIFACTS = BASE_DIR / "model_artifacts"
+ARTIFACT_DIR = "churn_model_artifacts"
 
 st.markdown("""
 <style>
