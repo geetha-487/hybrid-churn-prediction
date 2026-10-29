@@ -1,0 +1,25 @@
+{
+  "quantum_model": {
+    "Model": "Hybrid Quantum Model",
+    "Accuracy": 0.6543647977288858,
+    "Precision": 0.4157973174366617,
+    "Recall": 0.7459893048128342,
+    "F1 Score": 0.5339712918660288,
+    "ROC-AUC": 0.7509377664109123
+  },
+  "classical_model": {
+    "Model": "Classical Logistic Regression",
+    "Accuracy": 0.7444996451383961,
+    "Precision": 0.5126811594202898,
+    "Recall": 0.7566844919786097,
+    "F1 Score": 0.6112311015118791,
+    "ROC-AUC": 0.8242656746493063
+  },
+  "quantum_training_loss": [
+    1.8168384742713068,
+    1.3974585440883338,
+    1.0785082130220323,
+    0.9981358589111002,
+    0.9700232322366386
+  ]
+}

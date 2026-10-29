@@ -1,0 +1,13 @@
+{
+  "n_qubits": 4,
+  "epochs": 5,
+  "training_sample_size": 160,
+  "feature_names": [
+    "tenure",
+    "InternetService_Fiber optic",
+    "PaymentMethod_Electronic check",
+    "Contract_Two year"
+  ],
+  "probability_threshold": 0.5,
+  "circuit": "RY feature encoding, trainable RY/RZ rotations, nearest-neighbour CNOT entanglement, PauliZ measurement"
+}
